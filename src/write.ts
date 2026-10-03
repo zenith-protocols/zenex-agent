@@ -77,7 +77,11 @@ interface Plan {
     /** Quote-token decimals, for rendering numeric return values. */
     decimals?: number;
     /** What `--wait` should watch after a send. */
-    watch?: { kind: 'order'; isLong: boolean } | { kind: 'vault' };
+    watch?: { kind: 'order'; isLong: boolean; base: string; quote: string } | { kind: 'vault' };
+    /** Pair label for the plan header. */
+    symbol?: string;
+    /** Base / quote labels for `--wait` output. */
+    labels?: { base: string; quote: string };
 }
 
 /** The `-- fn --arg value …` tail exactly as the Stellar CLI's generated contract CLI takes it. */
@@ -90,7 +94,7 @@ function contractArgs(plan: Plan): string[] {
 function invokeArgv(session: Session, plan: Plan, opts: WriteOptions): string[] {
     const acct = requireAccount(session);
     const mode = opts.buildOnly ? ['--build-only'] : opts.send ? [] : ['--send=no'];
-    return ['contract', 'invoke', '--id', session.market.market, ...session.net.cliArgs, ...acct.cliArgs, ...configDirArgs(opts), ...mode, ...contractArgs(plan)];
+    return ['contract', 'invoke', '--id', session.marketContract, ...session.net.cliArgs, ...acct.cliArgs, ...configDirArgs(opts), ...mode, ...contractArgs(plan)];
 }
 
 async function execute(session: Session, plan: Plan, opts: WriteOptions): Promise<void> {
@@ -99,8 +103,8 @@ async function execute(session: Session, plan: Plan, opts: WriteOptions): Promis
     const command = `stellar ${shellQuote(argv)}`;
     const mode = opts.buildOnly ? 'BUILD ONLY: simulated, unsigned envelope on stdout; pipe into `stellar tx sign --sign-with-key <id>` | `stellar tx send`' : opts.send ? 'SEND: signing and submitting' : 'DRY RUN: simulated only, nothing sent. Add --send to submit.';
     const header: [string, string][] = [
-        ['network', session.pin.key.toUpperCase()],
-        ['market', `${session.market.symbol} ${session.market.market}`],
+        ['network', session.dep.name.toUpperCase()],
+        ['market', `${plan.symbol ?? ''} ${session.marketContract}`.trim()],
         ['account', `${acct.ref} (${shortAddr(acct.address)})`],
         ['action', plan.action],
         ...plan.lines,
@@ -219,14 +223,14 @@ export async function cmdOpen(opts: WriteOptions & SideOptions & { size?: string
     const snap = await loadSnapshot(s);
     const isLong = side(opts);
     const bps = slippageBps(opts);
-    const { notional, margin, describe } = sizing(snap, opts, s.market.quote);
+    const { notional, margin, describe } = sizing(snap, opts, snap.labels.quote);
     const intent = new OrderIntent(snap.market, acct.address, isLong, ttl(opts), bps);
     const order = intent.openMarket({ notional, margin, price: snap.price });
     const position = isLong ? snap.user!.long : snap.user!.short;
-    const { lines, preview } = previewLines(snap, position, order, s.market.quote, s.market.base);
+    const { lines, preview } = previewLines(snap, position, order, snap.labels.quote, snap.labels.base);
     const entry = isLong ? snap.price.ask : snap.price.bid;
     await execute(s, {
-        action: `open ${isLong ? 'LONG' : 'SHORT'} ${fmtAmount(notional, snap.market.assetDecimals)} ${s.market.quote} at ${describe}${position.isOpen() ? ' (adds to the open position)' : ''}`,
+        action: `open ${isLong ? 'LONG' : 'SHORT'} ${fmtAmount(notional, snap.market.assetDecimals)} ${snap.labels.quote} at ${describe}${position.isOpen() ? ' (adds to the open position)' : ''}`,
         lines: [
             ['price', `bid ${fmtPrice(snap.price.bid)} / ask ${fmtPrice(snap.price.ask)}; entry side ${fmtPrice(entry)}`],
             ['price bound', `${isLong ? 'max' : 'min'} fill ${fmtPrice(order.priceBound)} (slippage ${fmtBps(bps)})`],
@@ -235,7 +239,8 @@ export async function cmdOpen(opts: WriteOptions & SideOptions & { size?: string
         ],
         ...orderPlan('create_order', order),
         preview,
-        watch: { kind: 'order', isLong },
+        watch: { kind: 'order', isLong, base: snap.labels.base, quote: snap.labels.quote },
+        symbol: snap.labels.symbol,
     }, opts);
 }
 
@@ -255,13 +260,13 @@ export async function cmdClose(opts: WriteOptions & SideOptions & { size?: strin
         const notional = parseAmount(opts.size, d, 'size');
         const margin = opts.withdraw ? parseAmount(opts.withdraw, d, 'withdraw') : 0n;
         order = intent.decrease({ notional, margin, price: snap.price });
-        action = `decrease ${isLong ? 'LONG' : 'SHORT'} by ${fmtAmount(notional, d)} ${s.market.quote} of ${fmtAmount(position.notional, d)}${margin ? `, withdraw ${fmtAmount(margin, d)} ${s.market.quote} margin` : ''}`;
+        action = `decrease ${isLong ? 'LONG' : 'SHORT'} by ${fmtAmount(notional, d)} ${snap.labels.quote} of ${fmtAmount(position.notional, d)}${margin ? `, withdraw ${fmtAmount(margin, d)} ${snap.labels.quote} margin` : ''}`;
     } else {
         if (opts.withdraw) throw new Error('--withdraw only applies to a partial close (--size); a full close returns all margin');
         order = intent.closePosition(snap.price);
-        action = `close ${isLong ? 'LONG' : 'SHORT'} in full (${fmtAmount(position.notional, d)} ${s.market.quote})`;
+        action = `close ${isLong ? 'LONG' : 'SHORT'} in full (${fmtAmount(position.notional, d)} ${snap.labels.quote})`;
     }
-    const { lines, preview } = previewLines(snap, position, order, s.market.quote, s.market.base);
+    const { lines, preview } = previewLines(snap, position, order, snap.labels.quote, snap.labels.base);
     await execute(s, {
         action,
         lines: [
@@ -272,7 +277,8 @@ export async function cmdClose(opts: WriteOptions & SideOptions & { size?: strin
         ],
         ...orderPlan('create_order', order),
         preview,
-        watch: { kind: 'order', isLong },
+        watch: { kind: 'order', isLong, base: snap.labels.base, quote: snap.labels.quote },
+        symbol: snap.labels.symbol,
     }, opts);
 }
 
@@ -286,14 +292,14 @@ export async function cmdLimit(opts: WriteOptions & SideOptions & { size?: strin
     if (opts.at && opts.away) throw new Error('pass --at or --away, not both');
     // A long limit sits below the current ask, a short limit above the current bid.
     const triggerPrice = opts.at ? parsePrice(opts.at, 'limit price') : awayFrom(isLong ? snap.price.ask : snap.price.bid, opts.away!, isLong);
-    const { notional, margin, describe } = sizing(snap, opts, s.market.quote);
+    const { notional, margin, describe } = sizing(snap, opts, snap.labels.quote);
     const intent = new OrderIntent(snap.market, acct.address, isLong, ttl(opts), bps);
     const order = intent.openLimit({ notional, margin, triggerPrice });
     const position = isLong ? snap.user!.long : snap.user!.short;
-    const { lines, preview } = previewLines(snap, position, order, s.market.quote, s.market.base);
+    const { lines, preview } = previewLines(snap, position, order, snap.labels.quote, snap.labels.base);
     const cmp = isLong ? 'at or below' : 'at or above';
     await execute(s, {
-        action: `limit ${isLong ? 'LONG' : 'SHORT'} ${fmtAmount(notional, snap.market.assetDecimals)} ${s.market.quote} at ${describe}, fills ${cmp} ${fmtPrice(triggerPrice)}`,
+        action: `limit ${isLong ? 'LONG' : 'SHORT'} ${fmtAmount(notional, snap.market.assetDecimals)} ${snap.labels.quote} at ${describe}, fills ${cmp} ${fmtPrice(triggerPrice)}`,
         lines: [
             ['price now', `bid ${fmtPrice(snap.price.bid)} / ask ${fmtPrice(snap.price.ask)}`],
             ['price bound', `${isLong ? 'max' : 'min'} fill ${fmtPrice(order.priceBound)} (slippage ${fmtBps(bps)} past the trigger)`],
@@ -302,7 +308,8 @@ export async function cmdLimit(opts: WriteOptions & SideOptions & { size?: strin
         ],
         ...orderPlan('create_order', order),
         preview,
-        watch: { kind: 'order', isLong },
+        watch: { kind: 'order', isLong, base: snap.labels.base, quote: snap.labels.quote },
+        symbol: snap.labels.symbol,
     }, opts);
 }
 
@@ -329,9 +336,9 @@ async function exitOrder(kind: 'tp' | 'sl', opts: WriteOptions & SideOptions & {
     if (!favorable) {
         throw new Error(`a ${kind === 'tp' ? 'take-profit' : 'stop-loss'} on a ${isLong ? 'long' : 'short'} must sit ${kind === 'tp' ? (isLong ? 'above' : 'below') : (isLong ? 'below' : 'above')} the current exit price ${fmtPrice(exit)}`);
     }
-    const { lines, preview } = previewLines(snap, position, order, s.market.quote, s.market.base);
+    const { lines, preview } = previewLines(snap, position, order, snap.labels.quote, snap.labels.base);
     await execute(s, {
-        action: `${kind === 'tp' ? 'take-profit' : 'stop-loss'} on ${isLong ? 'LONG' : 'SHORT'}: close ${notional ? `${fmtAmount(notional, d)} ${s.market.quote}` : 'in full'} when price crosses ${fmtPrice(triggerPrice)}`,
+        action: `${kind === 'tp' ? 'take-profit' : 'stop-loss'} on ${isLong ? 'LONG' : 'SHORT'}: close ${notional ? `${fmtAmount(notional, d)} ${snap.labels.quote}` : 'in full'} when price crosses ${fmtPrice(triggerPrice)}`,
         lines: [
             ['price now', `bid ${fmtPrice(snap.price.bid)} / ask ${fmtPrice(snap.price.ask)}`],
             ['price bound', `${isLong ? 'min' : 'max'} fill ${fmtPrice(order.priceBound)} (slippage ${fmtBps(bps)} past the trigger)`],
@@ -340,7 +347,8 @@ async function exitOrder(kind: 'tp' | 'sl', opts: WriteOptions & SideOptions & {
         ],
         ...orderPlan('create_order', order),
         preview,
-        watch: { kind: 'order', isLong },
+        watch: { kind: 'order', isLong, base: snap.labels.base, quote: snap.labels.quote },
+        symbol: snap.labels.symbol,
     }, opts);
 }
 
@@ -358,13 +366,14 @@ export async function cmdMargin(action: 'add' | 'withdraw', amountText: string, 
     if (!position.isOpen()) throw new Error(`no open ${isLong ? 'long' : 'short'} position`);
     const intent = new OrderIntent(snap.market, acct.address, isLong, ttl(opts), 0n);
     const order = action === 'add' ? intent.addMargin(amount) : intent.withdrawMargin(amount);
-    const { lines, preview } = previewLines(snap, position, order, s.market.quote, s.market.base);
+    const { lines, preview } = previewLines(snap, position, order, snap.labels.quote, snap.labels.base);
     await execute(s, {
-        action: `${action} ${fmtAmount(amount, d)} ${s.market.quote} margin ${action === 'add' ? 'to' : 'from'} the ${isLong ? 'LONG' : 'SHORT'} position`,
+        action: `${action} ${fmtAmount(amount, d)} ${snap.labels.quote} margin ${action === 'add' ? 'to' : 'from'} the ${isLong ? 'LONG' : 'SHORT'} position`,
         lines: [['expires', `ledger ${order.expiration}`], ...lines],
         ...orderPlan('create_order', order),
         preview,
-        watch: { kind: 'order', isLong },
+        watch: { kind: 'order', isLong, base: snap.labels.base, quote: snap.labels.quote },
+        symbol: snap.labels.symbol,
     }, opts);
 }
 
@@ -377,13 +386,14 @@ export async function cmdCancel(opts: WriteOptions & { id?: string }): Promise<v
     const orders = await snap.user!.loadOrders(s.sdkNetwork);
     const hit = orders.find((o) => o.id === id);
     if (!hit) throw new Error(`order #${id} is not resting for ${acct.ref} (already filled, cancelled, or expired)`);
-    const desc = describeOrder(hit, snap.market.assetDecimals, s.market.quote, snap.market.assetDecimals + snap.market.vaultDecimalsOffset);
+    const desc = describeOrder(hit, snap.market.assetDecimals, snap.labels.quote, snap.market.assetDecimals + snap.market.vaultDecimalsOffset);
     await execute(s, {
         action: `cancel ${desc.slice(0, 1)[0]} ${desc[2]} ${desc[3]} (escrow is refunded)`,
         lines: [],
         fn: hit.type === 'order' ? 'cancel_order' : 'cancel_vault_order',
         args: { user: acct.address, id: String(id) },
         decimals: snap.market.assetDecimals,
+        symbol: snap.labels.symbol,
     }, opts);
 }
 
@@ -394,11 +404,12 @@ export async function cmdClaim(opts: WriteOptions): Promise<void> {
     const credit = snap.user!.claimableCredit;
     if (credit <= 0n) throw new Error('nothing to claim');
     await execute(s, {
-        action: `claim ${fmtAmount(credit, snap.market.assetDecimals)} ${s.market.quote} of credit`,
+        action: `claim ${fmtAmount(credit, snap.market.assetDecimals)} ${snap.labels.quote} of credit`,
         lines: [],
         fn: 'claim_credit',
         args: { user: acct.address },
         decimals: snap.market.assetDecimals,
+        symbol: snap.labels.symbol,
     }, opts);
 }
 
@@ -414,11 +425,11 @@ export async function cmdVault(kind: 'deposit' | 'redeem', amountText: string | 
         if (!amountText) throw new Error('deposit <quote amount> is required');
         amount = parseAmount(amountText, d, 'deposit');
         if (amount < snap.market.config.minDeposit) {
-            throw new Error(`deposit ${fmtAmount(amount, d)} ${s.market.quote} is below the vault minimum of ${fmtAmount(snap.market.config.minDeposit, d)} ${s.market.quote}`);
+            throw new Error(`deposit ${fmtAmount(amount, d)} ${snap.labels.quote} is below the vault minimum of ${fmtAmount(snap.market.config.minDeposit, d)} ${snap.labels.quote}`);
         }
     } else if (opts.all) {
         const { loadTokenBalance } = await import('@zenith-protocols/zenex-sdk');
-        amount = await loadTokenBalance(s.sdkNetwork, s.market.vault, acct.address);
+        amount = await loadTokenBalance(s.sdkNetwork, snap.contracts.vault, acct.address);
         if (amount <= 0n) throw new Error('no vault shares to redeem');
     } else {
         if (!amountText) throw new Error('redeem <shares> or --all is required');
@@ -427,10 +438,10 @@ export async function cmdVault(kind: 'deposit' | 'redeem', amountText: string | 
     const vk = kind === 'deposit' ? VaultOrderKind.Deposit : VaultOrderKind.Redeem;
     const intent = VaultOrderIntent.create(snap.market, acct.address, vk, amount, bps, snap.price);
     const expected = intent.expectedOut(snap.market, snap.price);
-    const outLabel = kind === 'deposit' ? `${fmtAmount(expected, shareDecimals, 6)} shares` : `${fmtAmount(expected, d)} ${s.market.quote}`;
-    const minLabel = kind === 'deposit' ? `${fmtAmount(intent.minOut, shareDecimals, 6)} shares` : `${fmtAmount(intent.minOut, d)} ${s.market.quote}`;
+    const outLabel = kind === 'deposit' ? `${fmtAmount(expected, shareDecimals, 6)} shares` : `${fmtAmount(expected, d)} ${snap.labels.quote}`;
+    const minLabel = kind === 'deposit' ? `${fmtAmount(intent.minOut, shareDecimals, 6)} shares` : `${fmtAmount(intent.minOut, d)} ${snap.labels.quote}`;
     await execute(s, {
-        action: kind === 'deposit' ? `deposit ${fmtAmount(amount, d)} ${s.market.quote} into the vault` : `redeem ${fmtAmount(amount, shareDecimals, 6)} vault shares`,
+        action: kind === 'deposit' ? `deposit ${fmtAmount(amount, d)} ${snap.labels.quote} into the vault` : `redeem ${fmtAmount(amount, shareDecimals, 6)} vault shares`,
         lines: [
             ['expected', `${outLabel} at share price ${fmtNum(Number(snap.market.sharesToAssets(10n ** BigInt(shareDecimals), snap.price)) / 10 ** d, 6)}`],
             ['minimum out', `${minLabel} (slippage ${fmtBps(bps)}); a keeper fills it, cancel refunds the escrow`],
@@ -439,6 +450,7 @@ export async function cmdVault(kind: 'deposit' | 'redeem', amountText: string | 
         fn: 'create_vault_order',
         args: { user: acct.address, kind: String(vk), amount: amount.toString(), min_out: intent.minOut.toString() },
         watch: { kind: 'vault' },
+        symbol: snap.labels.symbol,
     }, opts);
 }
 
@@ -448,13 +460,15 @@ export { ORDER_KIND_NAMES, OrderKind };
 export async function cmdTrustline(opts: WriteOptions): Promise<void> {
     const s = await openSession(opts);
     const acct = requireAccount(s);
-    const asset = await classicAssetOf(s.sdkNetwork, s.market.collateral);
+    const { Market } = await import('@zenith-protocols/zenex-sdk');
+    const contracts = await Market.resolveContracts(s.sdkNetwork, s.marketContract);
+    const asset = await classicAssetOf(s.sdkNetwork, contracts.token);
     const argv = ['tx', 'new', 'change-trust', ...s.net.cliArgs, ...acct.cliArgs, ...configDirArgs(opts), '--line', asset.line, ...(opts.buildOnly ? ['--build-only'] : [])];
     const command = `stellar ${shellQuote(argv)}`;
     const header: [string, string][] = [
-        ['network', s.pin.key.toUpperCase()],
+        ['network', s.dep.name.toUpperCase()],
         ['account', `${acct.ref} (${shortAddr(acct.address)})`],
-        ['action', `add a trustline for ${asset.code} issued by ${asset.issuer} (the ${s.market.symbol} collateral)`],
+        ['action', `add a trustline for ${asset.code} issued by ${asset.issuer} (the collateral of market ${s.marketContract})`],
         ['mode', opts.buildOnly ? 'BUILD ONLY: unsigned XDR on stdout' : opts.send ? 'SEND: signing and submitting' : 'DRY RUN: nothing sent. Add --send to submit.'],
     ];
     if (opts.print) {
@@ -502,7 +516,7 @@ async function waitForOrder(session: Session, id: number, watch: NonNullable<Pla
                 return;
             }
             const est = estimatePosition(m, p, snap.price);
-            process.stdout.write(`order #${id} filled. Position now:\n` + kv(positionRows(p, est, session.market.base, session.market.quote)) + '\n');
+            process.stdout.write(`order #${id} filled. Position now:\n` + kv(positionRows(p, est, watch.base, watch.quote)) + '\n');
             return;
         }
         if (Date.now() > deadline) {

@@ -32,7 +32,7 @@ stellar zenex trustline --send        # adds the collateral trustline (classic a
 stellar zenex balance                 # shows XLM, USDC, vault shares, claimable credit
 ```
 
-Mainnet: the Stellar CLI's built-in `mainnet` has no RPC; the plugin falls back to a public one. For your own, `stellar network add mainnet --rpc-url <url> --network-passphrase "Public Global Stellar Network ; September 2015"`.
+Mainnet: the Stellar CLI's built-in `mainnet` has no RPC, so configure one once: `stellar network add mainnet --rpc-url <url> --network-passphrase "Public Global Stellar Network ; September 2015"` (public endpoints: https://developers.stellar.org/docs/data/rpc/rpc-providers). The plugin uses exactly the network and account the Stellar CLI resolves (`stellar env`).
 
 ## Rules
 

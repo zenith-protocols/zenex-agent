@@ -9,7 +9,7 @@ What `stellar zenex` encodes, for reading raw chain data or auditing a plan. Do 
 | mainnet | `CAOZCITWHWAXH5FRU4EULQ5EN2HMTCHICRNC4R5ZAOVD7XHCCQSJ42IB` | `CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75` | `CB2MX4WXJHOHCTDTN5DCFC7G3TLFLOYLCRCINPK7G2A3EUVW2AYVA56N` | `https://api.zenex.trade` |
 | testnet | `CCOIDO46A4HHBOQQSHKY3RC6BM6HE3V7UMYNICG7PA7ABS422W672F6U` | `CD4MP2QV4LABFU5OL6Y5RICCLQIX7TWT6T6J546EDYVUXHH6RS2V5S2O` | `CCKXT53FROOVQOMFWTOM5F3UHRXBX7CYAZKLPZ4GZ3WOD7XZBFQ2VNF4` | `https://api-testnet.zenex.trade` |
 
-`stellar zenex markets` prints the set pinned in the installed version. The full public record is at https://docs.zenex.trade/deployments.
+The plugin pins only the market contracts; `stellar zenex markets` prints them with the collateral and vault the API lists. Vault, collateral, feed id and decimals are read from the market contract itself (`get_vault`, `get_token`, `get_feed`). The full public record is at https://docs.zenex.trade/deployments.
 
 ## Units
 

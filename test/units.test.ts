@@ -1,7 +1,8 @@
+import { Networks } from '@stellar/stellar-sdk';
 import { describe, expect, it } from 'vitest';
 import { marginForLeverage, parseAmount, parseLeverage, parsePercentBps, parsePrice } from '../src/units.js';
-import { parseToml } from '../src/stellar.js';
-import { findMarket, NETWORKS, pinForPassphrase } from '../src/networks.js';
+import { parseNetworkList } from '../src/stellar.js';
+import { DEPLOYMENTS, deploymentFor, isContractAddress } from '../src/networks.js';
 
 describe('amounts', () => {
     it('parses quote amounts at 7 decimals', () => {
@@ -35,32 +36,35 @@ describe('amounts', () => {
     });
 });
 
-describe('stellar cli config', () => {
-    it('reads the defaults and network files the CLI writes', () => {
-        const cfg = parseToml('[defaults]\nnetwork = "mainnet"\nidentity = "bot"\n');
-        expect(cfg['defaults']).toEqual({ network: 'mainnet', identity: 'bot' });
-        const net = parseToml('rpc_url = "https://rpc.example"\nrpc_headers = []\nnetwork_passphrase = "Test SDF Network ; September 2015"\n');
-        expect(net['']?.['rpc_url']).toBe('https://rpc.example');
-        expect(net['']?.['network_passphrase']).toBe('Test SDF Network ; September 2015');
+describe('stellar cli network list', () => {
+    it('parses `stellar network ls -l`, keeping order so configured entries shadow built-ins', () => {
+        const text = [
+            'Name: mainnet', 'RPC url: https://rpc.example/', 'RPC headers: not set', `Network passphrase: ${Networks.PUBLIC}`, '',
+            'Name: mainnet', 'RPC url: Bring Your Own: https://developers.stellar.org/docs/data/rpc/rpc-providers', 'RPC headers: not set', `Network passphrase: ${Networks.PUBLIC}`, '',
+            'Name: testnet', 'RPC url: https://soroban-testnet.stellar.org/', 'RPC headers: not set', `Network passphrase: ${Networks.TESTNET}`,
+        ].join('\n');
+        const list = parseNetworkList(text);
+        expect(list).toHaveLength(3);
+        expect(list[0]).toEqual({ name: 'mainnet', rpc: 'https://rpc.example/', passphrase: Networks.PUBLIC });
+        expect(list[1]?.rpc).toMatch(/^Bring Your Own/);
+        expect(list.find((n) => n.name === 'testnet')?.passphrase).toBe(Networks.TESTNET);
     });
 });
 
-describe('pinned networks', () => {
-    it('maps passphrases to deployments and resolves markets by id, pair or contract', () => {
-        expect(pinForPassphrase(NETWORKS.testnet.passphrase)?.key).toBe('testnet');
-        expect(pinForPassphrase('Standalone Network ; February 2017')).toBeUndefined();
-        const m = NETWORKS.mainnet.markets[0]!;
-        expect(findMarket(NETWORKS.mainnet, 'XLM-USD')).toBe(m);
-        expect(findMarket(NETWORKS.mainnet, m.market)).toBe(m);
-        expect(findMarket(NETWORKS.mainnet, undefined)).toBe(m);
-        expect(() => findMarket(NETWORKS.mainnet, 'btc-usd')).toThrow(/unknown market/);
+describe('pinned deployments', () => {
+    it('are keyed by the SDK network passphrases', () => {
+        expect(deploymentFor(Networks.PUBLIC).name).toBe('mainnet');
+        expect(deploymentFor(Networks.TESTNET).name).toBe('testnet');
+        expect(() => deploymentFor('Standalone Network ; February 2017')).toThrow(/mainnet and testnet only/);
     });
-    it('pins contract addresses of the right shape', () => {
-        for (const net of Object.values(NETWORKS)) {
-            for (const m of net.markets) {
-                for (const addr of [m.market, m.vault, m.collateral]) expect(addr).toMatch(/^C[A-Z2-7]{55}$/);
-                expect(m.feedId).toMatch(/^0x0003[0-9a-f]{60}$/);
+    it('pin only market contracts, of the right shape', () => {
+        for (const dep of Object.values(DEPLOYMENTS)) {
+            expect(dep.markets.length).toBeGreaterThan(0);
+            for (const c of dep.markets) {
+                expect(isContractAddress(c)).toBe(true);
+                expect(c).toMatch(/^C[A-Z2-7]{55}$/);
             }
+            expect(dep.api).toMatch(/^https:\/\//);
         }
     });
 });

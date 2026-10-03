@@ -3,7 +3,6 @@
  * endpoints, no key. Rate limited per IP (read routes: 100 requests/min),
  * so a bot polls prices, not history, in a loop.
  */
-import type { MarketPin, NetworkPin } from './networks.js';
 
 export interface Ticker {
     marketId: string;
@@ -14,6 +13,16 @@ export interface Ticker {
     ask: string;
     observationsTimestamp: number;
     validFromTimestamp: number;
+}
+
+/** What the API knows about a market, from `GET /v1/config`. */
+export interface ApiMarket {
+    id: string;
+    trading: string;
+    vault: string;
+    collateral: string;
+    feedId: string;
+    chartSymbol: string;
 }
 
 export interface Candle {
@@ -39,27 +48,39 @@ async function getJson<T>(url: string): Promise<T> {
     return (await res.json()) as T;
 }
 
-export async function fetchTicker(pin: NetworkPin, market: MarketPin): Promise<Ticker> {
-    const body = await getJson<{ data: Ticker[] }>(`${pin.api}/v1/prices/tickers`);
-    const hit = body.data.find((t) => t.marketId === market.id || t.feedID === market.feedId);
-    if (!hit) throw new Error(`no ticker for ${market.id} on ${pin.key}`);
+const configCache = new Map<string, Promise<ApiMarket[]>>();
+
+/** The API's market list, fetched once per process per origin. */
+export function fetchApiMarkets(api: string): Promise<ApiMarket[]> {
+    let hit = configCache.get(api);
+    if (!hit) {
+        hit = getJson<{ markets: ApiMarket[] }>(`${api}/v1/config`).then((c) => c.markets);
+        configCache.set(api, hit);
+    }
     return hit;
 }
 
-export async function fetchCandles(
-    pin: NetworkPin,
-    market: MarketPin,
-    resolution: string,
-    from: number,
-    to: number,
-): Promise<Candle[]> {
+/** The API's entry for a market contract, or undefined when the API does not list it. */
+export async function apiMarketFor(api: string, marketContract: string): Promise<ApiMarket | undefined> {
+    return (await fetchApiMarkets(api)).find((m) => m.trading === marketContract);
+}
+
+/** The live ticker for a feed (the market's on-chain anchor), matched by feed id. */
+export async function fetchTicker(api: string, feedIdHex: string): Promise<Ticker> {
+    const body = await getJson<{ data: Ticker[] }>(`${api}/v1/prices/tickers`);
+    const hit = body.data.find((t) => t.feedID.toLowerCase() === feedIdHex.toLowerCase());
+    if (!hit) throw new Error(`${api} serves no ticker for feed ${feedIdHex}`);
+    return hit;
+}
+
+export async function fetchCandles(api: string, chartSymbol: string, resolution: string, from: number, to: number): Promise<Candle[]> {
     const res = RESOLUTIONS[resolution];
     if (res === undefined) {
         throw new Error(`unsupported resolution "${resolution}"; use one of ${Object.keys(RESOLUTIONS).join(', ')}`);
     }
-    const q = new URLSearchParams({ symbol: market.chartSymbol, resolution: res, from: String(from), to: String(to) });
+    const q = new URLSearchParams({ symbol: chartSymbol, resolution: res, from: String(from), to: String(to) });
     const body = await getJson<{ s: string; t?: number[]; o?: number[]; h?: number[]; l?: number[]; c?: number[]; errmsg?: string }>(
-        `${pin.api}/v1/prices/udf/history?${q}`,
+        `${api}/v1/prices/udf/history?${q}`,
     );
     if (body.s === 'no_data') return [];
     if (body.s !== 'ok') throw new Error(`candles: ${body.errmsg ?? body.s}`);
@@ -118,29 +139,6 @@ export interface Lifecycle {
     activityCount: number;
 }
 
-export interface IndexedOrder {
-    [key: string]: unknown;
-}
-
-async function page<T>(url: string, params: Record<string, string | undefined>): Promise<Page<T>> {
-    const q = new URLSearchParams();
-    for (const [k, v] of Object.entries(params)) if (v !== undefined) q.set(k, v);
-    const body = await getJson<{ data: Page<T> }>(`${url}?${q}`);
-    return body.data;
-}
-
-export function fetchFills(pin: NetworkPin, account: string, market: MarketPin, limit: number, cursor?: string): Promise<Page<Fill>> {
-    return page<Fill>(`${pin.api}/v1/accounts/${account}/trade/fills`, { market: market.id, limit: String(limit), cursor });
-}
-
-export function fetchLifecycles(pin: NetworkPin, account: string, market: MarketPin, limit: number, cursor?: string): Promise<Page<Lifecycle>> {
-    return page<Lifecycle>(`${pin.api}/v1/accounts/${account}/trade/lifecycles`, { market: market.id, limit: String(limit), cursor });
-}
-
-export function fetchIndexedOrders(pin: NetworkPin, account: string, market: MarketPin, limit: number, cursor?: string): Promise<Page<IndexedOrder>> {
-    return page<IndexedOrder>(`${pin.api}/v1/accounts/${account}/trade/orders`, { market: market.id, limit: String(limit), cursor });
-}
-
 /** One anonymized fill from the market-wide tape. */
 export interface MarketTrade {
     id: string;
@@ -153,6 +151,21 @@ export interface MarketTrade {
     transactionHash: string;
 }
 
-export function fetchMarketTrades(pin: NetworkPin, market: MarketPin, limit: number, cursor?: string): Promise<Page<MarketTrade>> {
-    return page<MarketTrade>(`${pin.api}/v1/markets/${market.id}/trades`, { limit: String(limit), cursor });
+async function page<T>(url: string, params: Record<string, string | undefined>): Promise<Page<T>> {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v !== undefined) q.set(k, v);
+    const body = await getJson<{ data: Page<T> }>(`${url}?${q}`);
+    return body.data;
+}
+
+export function fetchFills(api: string, account: string, marketId: string, limit: number, cursor?: string): Promise<Page<Fill>> {
+    return page<Fill>(`${api}/v1/accounts/${account}/trade/fills`, { market: marketId, limit: String(limit), cursor });
+}
+
+export function fetchLifecycles(api: string, account: string, marketId: string, limit: number, cursor?: string): Promise<Page<Lifecycle>> {
+    return page<Lifecycle>(`${api}/v1/accounts/${account}/trade/lifecycles`, { market: marketId, limit: String(limit), cursor });
+}
+
+export function fetchMarketTrades(api: string, marketId: string, limit: number, cursor?: string): Promise<Page<MarketTrade>> {
+    return page<MarketTrade>(`${api}/v1/markets/${marketId}/trades`, { limit: String(limit), cursor });
 }

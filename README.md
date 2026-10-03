@@ -39,15 +39,17 @@ Guardrails: slippage defaults to 1% and refuses more than 5% without `--force`; 
 
 ## How it resolves
 
-Network: `-n`, else `STELLAR_NETWORK`, else `stellar network use`, else `testnet`; `~/.config/stellar/network/<name>.toml` supplies the RPC, and the built-in `mainnet` (which has none) falls back to a public endpoint. Account: `-s`, else `STELLAR_ACCOUNT`, else `stellar keys use`; the address comes from `stellar keys address`. Markets are pinned per network in `src/networks.ts` — a new market is a new release.
+Everything the Stellar CLI knows, the plugin asks it for: the network comes from `-n`, else `stellar env STELLAR_NETWORK` (the environment or `stellar network use`), else `testnet`, and its RPC and passphrase from `stellar network ls -l`; the account from `-s`, else `stellar env STELLAR_ACCOUNT`, and its address from `stellar keys address`. The built-in `mainnet` has no RPC, so mainnet needs one `stellar network add mainnet --rpc-url <url> --network-passphrase "Public Global Stellar Network ; September 2015"` (or `--rpc-url` + `--network-passphrase` on the call).
+
+The plugin pins only the market contracts per network passphrase (`src/networks.ts`) and the Zenex API origin. Vault, collateral, feed id and decimals are read from the market contract; the pair name comes from the API's ticker and the quote symbol from the collateral asset itself. `-m` takes a contract address (any market, pinned or not) or the id the API lists (`xlm-usd`).
 
 ## Layout
 
 ```
 bin/stellar-zenex.js      plugin entry
 src/cli.ts                commands and flags
-src/networks.ts           pinned deployments
-src/stellar.ts            Stellar CLI config resolution and subprocess
+src/networks.ts           pinned market contracts per network
+src/stellar.ts            asks the Stellar CLI for network/account, runs it
 src/context.ts            session + chain snapshot + price
 src/units.ts              every human ↔ atomic conversion
 src/read.ts  src/write.ts the commands

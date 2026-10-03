@@ -1,24 +1,12 @@
 /**
- * The Stellar CLI is the source of truth for networks, identities and
- * signing. This module reads the same configuration the CLI reads
- * (`~/.config/stellar`, the `STELLAR_*` environment) so `stellar zenex`
- * resolves exactly what `stellar contract invoke` would, and runs the CLI
- * as a subprocess for every transaction. No key ever enters this process.
+ * The Stellar CLI owns networks, identities and signing. This module asks
+ * it for what it resolved (`stellar env`, `stellar network ls -l`,
+ * `stellar keys address`) instead of re-reading its configuration, and runs
+ * it as a subprocess for every transaction. No key ever enters this process.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { Keypair, StrKey } from '@stellar/stellar-sdk';
-import { NETWORKS, pinForPassphrase, type NetworkPin } from './networks.js';
-
-/** Built-in networks of the Stellar CLI (`stellar network ls`). */
-const BUILTIN: Record<string, { rpc: string | undefined; passphrase: string }> = {
-    testnet: { rpc: NETWORKS.testnet.defaultRpc, passphrase: NETWORKS.testnet.passphrase },
-    mainnet: { rpc: undefined, passphrase: NETWORKS.mainnet.passphrase },
-    futurenet: { rpc: 'https://rpc-futurenet.stellar.org:443', passphrase: 'Test SDF Future Network ; October 2022' },
-    local: { rpc: 'http://localhost:8000/rpc', passphrase: 'Standalone Network ; February 2017' },
-};
+import { deploymentFor, type Deployment } from './networks.js';
 
 export interface GlobalOptions {
     network?: string;
@@ -30,8 +18,8 @@ export interface GlobalOptions {
 
 export interface ResolvedNetwork {
     /** The Zenex deployment on this network. */
-    pin: NetworkPin;
-    /** Name as the Stellar CLI knows it, when it does. */
+    dep: Deployment;
+    /** Name as the Stellar CLI knows it, when resolved by name. */
     name: string | undefined;
     rpc: string;
     passphrase: string;
@@ -48,108 +36,84 @@ export interface ResolvedAccount {
     cliArgs: string[];
 }
 
-/** The Stellar CLI config directory: `--config-dir`, `$XDG_CONFIG_HOME/stellar`, or `~/.config/stellar`. */
-export function configDir(opts: GlobalOptions): string {
-    if (opts.configDir) return opts.configDir;
-    const xdg = process.env['XDG_CONFIG_HOME'];
-    return xdg ? join(xdg, 'stellar') : join(homedir(), '.config', 'stellar');
+export function configDirArgs(opts: GlobalOptions): string[] {
+    return opts.configDir ? ['--config-dir', opts.configDir] : [];
 }
 
-/**
- * The tiny TOML subset the CLI writes: `key = "string"`, `key = 123`,
- * `key = []`, and `[section]` headers. Enough to read defaults and networks.
- */
-export function parseToml(text: string): Record<string, Record<string, string>> {
-    const out: Record<string, Record<string, string>> = { '': {} };
-    let section = '';
-    for (const raw of text.split('\n')) {
-        const line = raw.trim();
-        if (line === '' || line.startsWith('#')) continue;
-        const header = /^\[([^\]]+)\]$/.exec(line);
-        if (header) {
-            section = header[1] ?? '';
-            out[section] ??= {};
-            continue;
+/** `stellar env NAME`: the value the CLI resolved from the environment or its `use` defaults, or undefined. */
+async function cliEnv(name: string, opts: GlobalOptions): Promise<string | undefined> {
+    const { stdout, code } = await runStellar(['env', name, ...configDirArgs(opts)], { quiet: true });
+    const value = stdout.trim();
+    return code === 0 && value !== '' ? value : undefined;
+}
+
+/** `stellar network ls -l`, parsed: every configured and built-in network the CLI knows. Configured entries come first and shadow built-ins. */
+export async function listNetworks(opts: GlobalOptions): Promise<{ name: string; rpc: string; passphrase: string }[]> {
+    const { stdout, code, stderr } = await runStellar(['network', 'ls', '-l', ...configDirArgs(opts)], { quiet: true });
+    if (code !== 0) throw new Error(`stellar network ls failed: ${stderr.trim()}`);
+    return parseNetworkList(stdout);
+}
+
+export function parseNetworkList(text: string): { name: string; rpc: string; passphrase: string }[] {
+    const out: { name: string; rpc: string; passphrase: string }[] = [];
+    let current: { name?: string; rpc?: string; passphrase?: string } = {};
+    const flush = () => {
+        if (current.name && current.rpc !== undefined && current.passphrase) {
+            out.push({ name: current.name, rpc: current.rpc, passphrase: current.passphrase });
         }
-        const kv = /^([A-Za-z0-9_-]+)\s*=\s*(.*)$/.exec(line);
-        if (!kv) continue;
-        let value = (kv[2] ?? '').trim();
-        if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
-        (out[section] ??= {})[kv[1] ?? ''] = value;
+        current = {};
+    };
+    for (const line of text.split('\n')) {
+        const m = /^(Name|RPC url|Network passphrase):\s*(.*)$/.exec(line.trim());
+        if (!m) continue;
+        const [, key, value] = m;
+        if (key === 'Name') {
+            flush();
+            current.name = value;
+        } else if (key === 'RPC url') current.rpc = (value ?? '').trim();
+        else if (key === 'Network passphrase') current.passphrase = (value ?? '').trim();
     }
+    flush();
     return out;
 }
 
-function readTomlFile(path: string): Record<string, Record<string, string>> | undefined {
-    if (!existsSync(path)) return undefined;
-    return parseToml(readFileSync(path, 'utf8'));
-}
-
-function defaults(opts: GlobalOptions): { network?: string; identity?: string } {
-    const cfg = readTomlFile(join(configDir(opts), 'config.toml'));
-    return {
-        network: cfg?.['defaults']?.['network'],
-        identity: cfg?.['defaults']?.['identity'],
-    };
-}
-
-/** Resolve the network the way the Stellar CLI does, then find the Zenex deployment on it. */
-export function resolveNetwork(opts: GlobalOptions): ResolvedNetwork {
-    const env = process.env;
-    const explicitRpc = opts.rpcUrl ?? env['STELLAR_RPC_URL'];
-    const explicitPassphrase = opts.networkPassphrase ?? env['STELLAR_NETWORK_PASSPHRASE'];
-
+/** Resolve the network exactly as the Stellar CLI would, then find the Zenex deployment on it. */
+export async function resolveNetwork(opts: GlobalOptions): Promise<ResolvedNetwork> {
+    const explicitRpc = opts.rpcUrl ?? process.env['STELLAR_RPC_URL'];
+    const explicitPassphrase = opts.networkPassphrase ?? process.env['STELLAR_NETWORK_PASSPHRASE'];
     if (explicitRpc && explicitPassphrase) {
-        const pin = pinForPassphrase(explicitPassphrase);
-        if (!pin) throw unsupported(explicitPassphrase);
         return {
-            pin,
+            dep: deploymentFor(explicitPassphrase),
             name: undefined,
             rpc: explicitRpc,
             passphrase: explicitPassphrase,
             cliArgs: ['--rpc-url', explicitRpc, '--network-passphrase', explicitPassphrase],
         };
     }
-
-    const name = opts.network ?? env['STELLAR_NETWORK'] ?? defaults(opts).network ?? 'testnet';
-    const file = readTomlFile(join(configDir(opts), 'network', `${name}.toml`));
-    let rpc = file?.['']?.['rpc_url'];
-    let passphrase = file?.['']?.['network_passphrase'];
-    if (!file) {
-        const builtin = BUILTIN[name];
-        if (!builtin) {
-            throw new Error(
-                `unknown network "${name}": add it with \`stellar network add ${name} --rpc-url … --network-passphrase …\` or pass --network mainnet|testnet`,
-            );
-        }
-        rpc = builtin.rpc;
-        passphrase = builtin.passphrase;
+    if (explicitRpc || explicitPassphrase) {
+        throw new Error('--rpc-url and --network-passphrase go together');
     }
-    if (!passphrase) throw new Error(`network "${name}" has no network_passphrase configured`);
-    const pin = pinForPassphrase(passphrase);
-    if (!pin) throw unsupported(passphrase);
 
-    // The CLI's built-in mainnet has no RPC ("bring your own"). Fall back to
-    // the pinned public endpoint and hand the CLI the explicit pair so it
-    // resolves without a `stellar network add`.
-    if (!rpc) {
-        rpc = pin.defaultRpc;
-        return { pin, name, rpc, passphrase, cliArgs: ['--rpc-url', rpc, '--network-passphrase', passphrase] };
-    }
-    return { pin, name, rpc, passphrase, cliArgs: ['--network', name] };
-}
-
-function unsupported(passphrase: string): Error {
-    return new Error(`Zenex is deployed on mainnet and testnet only (network passphrase "${passphrase}")`);
-}
-
-/** Resolve the signing account the way the Stellar CLI does, and its public address. */
-export async function resolveAccount(opts: GlobalOptions): Promise<ResolvedAccount> {
-    const ref = opts.sourceAccount ?? process.env['STELLAR_ACCOUNT'] ?? defaults(opts).identity;
-    if (!ref) {
+    const name = opts.network ?? (await cliEnv('STELLAR_NETWORK', opts)) ?? 'testnet';
+    const entry = (await listNetworks(opts)).find((n) => n.name === name);
+    if (!entry) {
         throw new Error(
-            'no account: pass --source-account <identity|G…>, set STELLAR_ACCOUNT, or run `stellar keys use <identity>`',
+            `the Stellar CLI knows no network "${name}": \`stellar network ls\`, or \`stellar network add ${name} --rpc-url … --network-passphrase …\``,
         );
+    }
+    if (!/^https?:\/\//.test(entry.rpc)) {
+        throw new Error(
+            `network "${name}" has no RPC configured (${entry.rpc}). Configure one: \`stellar network add ${name} --rpc-url <url> --network-passphrase "${entry.passphrase}"\``,
+        );
+    }
+    return { dep: deploymentFor(entry.passphrase), name, rpc: entry.rpc, passphrase: entry.passphrase, cliArgs: ['--network', name] };
+}
+
+/** Resolve the signing account exactly as the Stellar CLI would, and its public address. */
+export async function resolveAccount(opts: GlobalOptions): Promise<ResolvedAccount> {
+    const ref = opts.sourceAccount ?? (await cliEnv('STELLAR_ACCOUNT', opts));
+    if (!ref) {
+        throw new Error('no account: pass --source-account <identity|G…>, set STELLAR_ACCOUNT, or run `stellar keys use <identity>`');
     }
     return { ref, address: await addressOf(ref, opts), cliArgs: ['--source-account', ref] };
 }
@@ -161,13 +125,9 @@ export async function addressOf(ref: string, opts: GlobalOptions): Promise<strin
     const { stdout } = await runStellar(['keys', 'address', ref, ...configDirArgs(opts)], { quiet: true });
     const address = stdout.trim();
     if (!StrKey.isValidEd25519PublicKey(address)) {
-        throw new Error(`could not resolve identity "${ref}" (stellar keys address): ${address}`);
+        throw new Error(`could not resolve identity "${ref}" (stellar keys address): ${address || 'no such identity'}`);
     }
     return address;
-}
-
-export function configDirArgs(opts: GlobalOptions): string[] {
-    return opts.configDir ? ['--config-dir', opts.configDir] : [];
 }
 
 export interface RunResult {
