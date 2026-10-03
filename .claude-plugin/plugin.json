@@ -1,0 +1,9 @@
+{
+  "name": "zenex",
+  "description": "Trade and monitor Zenex perpetuals on Stellar through the `stellar zenex` CLI plugin: human units in, exact contract calls out, dry-run plans and fill previews before anything is sent.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Zenith Protocols"
+  },
+  "skills": "./skills/"
+}

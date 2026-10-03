@@ -1,0 +1,33 @@
+{
+  "name": "@zenith-protocols/stellar-zenex",
+  "version": "0.1.0",
+  "description": "Stellar CLI plugin for trading Zenex perpetuals: human units in, exact contract calls out. Keys, networks and signing stay in the Stellar CLI.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "stellar-zenex": "./bin/stellar-zenex.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^16.2.0",
+    "@zenith-protocols/zenex-sdk": "github:zenith-protocols/zenex-sdk-js#main",
+    "commander": "^14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "~5.8.3",
+    "vitest": "^3.2.0"
+  }
+}

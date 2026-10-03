@@ -1,0 +1,16 @@
+{
+  "$schema": "https://code.claude.com/schemas/marketplace.json",
+  "name": "zenex",
+  "owner": {
+    "name": "Zenith Protocols",
+    "url": "https://zenex.trade"
+  },
+  "plugins": [
+    {
+      "name": "zenex",
+      "source": "./",
+      "description": "Skill for trading Zenex perpetuals from the Stellar CLI",
+      "version": "0.1.0"
+    }
+  ]
+}
