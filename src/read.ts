@@ -10,6 +10,7 @@ import {
     VaultOrderKind,
     estimateMarket,
     estimatePosition,
+    formatToken,
     loadTokenBalance,
     type MarketPosition,
     type PendingOrder,
@@ -83,7 +84,16 @@ export async function cmdPrice(opts: SessionOptions & OutputOptions): Promise<vo
             ['spread', fmtPct((Number(ask - bid) / Number(ask)) * 100, 3)],
             ['observed', `${new Date(t.observationsTimestamp * 1000).toISOString()} (${age}s ago)`],
         ]),
-        { market: s.market.id, network: s.pin.key, bid: t.bid, ask: t.ask, mid: t.price, priceDecimals: PRICE_DECIMALS, observedAt: t.observationsTimestamp },
+        {
+            market: s.market.id,
+            network: s.pin.key,
+            bid: t.bid,
+            ask: t.ask,
+            mid: t.price,
+            priceDecimals: PRICE_DECIMALS,
+            decimal: { bid: formatToken(bid, PRICE_DECIMALS), ask: formatToken(ask, PRICE_DECIMALS), mid: formatToken(BigInt(t.price), PRICE_DECIMALS) },
+            observedAt: t.observationsTimestamp,
+        },
     );
 }
 
@@ -133,7 +143,7 @@ export async function cmdMarket(opts: SessionOptions & OutputOptions): Promise<v
     );
 }
 
-function positionRows(p: MarketPosition, est: ReturnType<typeof estimatePosition>, base: string, quote: string): [string, string][] {
+export function positionRows(p: MarketPosition, est: ReturnType<typeof estimatePosition>, base: string, quote: string): [string, string][] {
     return [
         ['side', p.isLong ? 'LONG' : 'SHORT'],
         ['size', `${fmtNum(est.notional)} ${quote} (${fmtNum(est.tokens, 4)} ${base})`],
@@ -220,6 +230,14 @@ export async function cmdBalance(opts: SessionOptions & OutputOptions): Promise<
         loadTokenBalance(s.sdkNetwork, s.market.vault, acct.address).catch(() => 0n),
     ]);
     const usdc = usdcOrNull ?? 0n;
+    const resting = await snap.user!.loadOrders(s.sdkNetwork);
+    let escrowedShares = 0n;
+    let escrowedDeposits = 0n;
+    for (const o of resting) {
+        if (o.type !== 'vaultOrder') continue;
+        if (o.order.kind === VaultOrderKind.Redeem) escrowedShares += o.order.amount;
+        else escrowedDeposits += o.order.amount;
+    }
     const collateralLine = usdcOrNull === null
         ? `NO TRUSTLINE — run \`stellar zenex trustline --send\` first, then fund the account with ${s.market.quote}`
         : `${fmtAmount(usdc, d)} (collateral, free to trade)`;
@@ -232,10 +250,10 @@ export async function cmdBalance(opts: SessionOptions & OutputOptions): Promise<
             ['network', s.pin.key],
             [s.market.quote, collateralLine],
             ['XLM', `${fmtAmount(xlm, 7)} (pays network fees)`],
-            ['vault shares', `${fmtAmount(shares, shareDecimals, 6)} (~${fmtAmount(snap.market.sharesToAssets(shares, snap.price), d)} ${s.market.quote})`],
+            ['vault shares', `${fmtAmount(shares, shareDecimals, 6)} (~${fmtAmount(snap.market.sharesToAssets(shares, snap.price), d)} ${s.market.quote})${escrowedShares ? `, plus ${fmtAmount(escrowedShares, shareDecimals, 6)} escrowed in a resting redeem` : ''}${escrowedDeposits ? `, plus ${fmtAmount(escrowedDeposits, d)} ${s.market.quote} escrowed in a resting deposit` : ''}`],
             ['claimable credit', `${fmtAmount(credit, d)} ${s.market.quote}${credit > 0n ? '  → stellar zenex claim' : ''}`],
         ]),
-        { account: acct.address, network: s.pin.key, collateral: usdc, hasTrustline: usdcOrNull !== null, xlm, vaultShares: shares, claimableCredit: credit, decimals: { collateral: d, shares: shareDecimals, xlm: 7 } },
+        { account: acct.address, network: s.pin.key, collateral: usdc, hasTrustline: usdcOrNull !== null, xlm, vaultShares: shares, escrowedShares, escrowedDeposits, claimableCredit: credit, decimals: { collateral: d, shares: shareDecimals, xlm: 7 } },
     );
 }
 

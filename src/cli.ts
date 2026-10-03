@@ -27,6 +27,7 @@ function writeFlags(cmd: Command): Command {
         .option('--print', 'print the `stellar contract invoke` command and stop')
         .option('--slippage <percent>', 'max adverse slippage in percent (default 1; above 5 needs --force)')
         .option('--ttl <ledgers>', 'order lifetime in ledgers, ~5s each (default 60)')
+        .option('--wait', 'with --send: poll until the keeper fills (or the order expires) and print the result')
         .option('--force', 'override the safety caps');
 }
 
@@ -76,14 +77,17 @@ export async function main(argv: string[]): Promise<void> {
         .option('--withdraw <quote>', 'margin to withdraw with a partial close')
         .action(cmdClose);
     sizeFlags(sideFlags(writeFlags(program.command('limit').description('open when the price reaches a level'))))
-        .requiredOption('--at <price>', 'limit price in quote (a long fills at or below, a short at or above)')
+        .option('--at <price>', 'limit price in quote (a long fills at or below, a short at or above)')
+        .option('--away <percent>', 'instead of --at: this far from the current price in the order\'s direction (a long limit below, a short above)')
         .action(cmdLimit);
     sideFlags(writeFlags(program.command('tp').description('take-profit: close when the price moves in your favour to a level')))
-        .requiredOption('--at <price>', 'trigger price')
+        .option('--at <price>', 'trigger price')
+        .option('--away <percent>', 'instead of --at: this far on the profitable side of the current exit price')
         .option('--size <quote>', 'notional to close; omit for the whole position')
         .action(cmdTakeProfit);
     sideFlags(writeFlags(program.command('sl').description('stop-loss: close when the price moves against you to a level')))
-        .requiredOption('--at <price>', 'trigger price')
+        .option('--at <price>', 'trigger price')
+        .option('--away <percent>', 'instead of --at: this far on the losing side of the current exit price')
         .option('--size <quote>', 'notional to close; omit for the whole position')
         .action(cmdStopLoss);
     const margin = program.command('margin').description('add or withdraw margin on an open position');

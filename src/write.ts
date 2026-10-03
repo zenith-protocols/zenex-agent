@@ -16,7 +16,8 @@ import {
     type OrderParams,
 } from '@zenith-protocols/zenex-sdk';
 import { loadSnapshot, openSession, requireAccount, type Session, type SessionOptions, type Snapshot } from './context.js';
-import { ORDER_KIND_NAMES, describeOrder, kv } from './read.js';
+import { ORDER_KIND_NAMES, describeOrder, kv, positionRows } from './read.js';
+import { estimatePosition } from '@zenith-protocols/zenex-sdk';
 import { configDirArgs, runStellar, shellQuote } from './stellar.js';
 import { classicAssetOf } from './token.js';
 import { fmtAmount, fmtBps, fmtNum, fmtPrice, marginForLeverage, parseAmount, parseLeverage, parsePercentBps, parsePrice, shortAddr, toJson } from './units.js';
@@ -33,6 +34,8 @@ export interface WriteOptions extends SessionOptions {
     force?: boolean;
     slippage?: string;
     ttl?: string;
+    /** After a send, poll until the order leaves the resting set and print the result. */
+    wait?: boolean;
 }
 
 export interface SideOptions {
@@ -73,6 +76,8 @@ interface Plan {
     preview?: unknown;
     /** Quote-token decimals, for rendering numeric return values. */
     decimals?: number;
+    /** What `--wait` should watch after a send. */
+    watch?: { kind: 'order'; isLong: boolean } | { kind: 'vault' };
 }
 
 /** The `-- fn --arg value …` tail exactly as the Stellar CLI's generated contract CLI takes it. */
@@ -137,6 +142,11 @@ async function execute(session: Session, plan: Plan, opts: WriteOptions): Promis
         return;
     }
     const num = /^"?(\d+)"?$/.exec(stdout)?.[1];
+    if (opts.send && opts.wait && plan.watch && num && plan.fn.startsWith('create')) {
+        process.stdout.write(`sent: order id ${num}${link ? `\n${link}` : ''}\nwaiting for the keeper…\n`);
+        await waitForOrder(session, Number(num), plan.watch, opts);
+        return;
+    }
     const idNote =
         plan.fn.startsWith('create') && num ? ` order id ${num}` :
         plan.fn.startsWith('cancel') && num ? ` refunded ${fmtAmount(BigInt(num), plan.decimals ?? 7)} escrow` :
@@ -225,6 +235,7 @@ export async function cmdOpen(opts: WriteOptions & SideOptions & { size?: string
         ],
         ...orderPlan('create_order', order),
         preview,
+        watch: { kind: 'order', isLong },
     }, opts);
 }
 
@@ -261,17 +272,20 @@ export async function cmdClose(opts: WriteOptions & SideOptions & { size?: strin
         ],
         ...orderPlan('create_order', order),
         preview,
+        watch: { kind: 'order', isLong },
     }, opts);
 }
 
-export async function cmdLimit(opts: WriteOptions & SideOptions & { size?: string; leverage?: string; margin?: string; at?: string }): Promise<void> {
+export async function cmdLimit(opts: WriteOptions & SideOptions & { size?: string; leverage?: string; margin?: string; at?: string; away?: string }): Promise<void> {
     const s = await openSession(opts);
     const acct = requireAccount(s);
     const snap = await loadSnapshot(s);
     const isLong = side(opts);
     const bps = slippageBps(opts);
-    if (!opts.at) throw new Error('--at <price> is required for a limit order');
-    const triggerPrice = parsePrice(opts.at, 'limit price');
+    if (!opts.at && !opts.away) throw new Error('--at <price> or --away <percent> is required for a limit order');
+    if (opts.at && opts.away) throw new Error('pass --at or --away, not both');
+    // A long limit sits below the current ask, a short limit above the current bid.
+    const triggerPrice = opts.at ? parsePrice(opts.at, 'limit price') : awayFrom(isLong ? snap.price.ask : snap.price.bid, opts.away!, isLong);
     const { notional, margin, describe } = sizing(snap, opts, s.market.quote);
     const intent = new OrderIntent(snap.market, acct.address, isLong, ttl(opts), bps);
     const order = intent.openLimit({ notional, margin, triggerPrice });
@@ -288,17 +302,22 @@ export async function cmdLimit(opts: WriteOptions & SideOptions & { size?: strin
         ],
         ...orderPlan('create_order', order),
         preview,
+        watch: { kind: 'order', isLong },
     }, opts);
 }
 
-async function exitOrder(kind: 'tp' | 'sl', opts: WriteOptions & SideOptions & { at?: string; size?: string }): Promise<void> {
+async function exitOrder(kind: 'tp' | 'sl', opts: WriteOptions & SideOptions & { at?: string; away?: string; size?: string }): Promise<void> {
     const s = await openSession(opts);
     const acct = requireAccount(s);
     const snap = await loadSnapshot(s);
     const isLong = side(opts);
     const bps = slippageBps(opts);
-    if (!opts.at) throw new Error(`--at <price> is required for a ${kind === 'tp' ? 'take-profit' : 'stop-loss'}`);
-    const triggerPrice = parsePrice(opts.at, 'trigger price');
+    if (!opts.at && !opts.away) throw new Error(`--at <price> or --away <percent> is required for a ${kind === 'tp' ? 'take-profit' : 'stop-loss'}`);
+    if (opts.at && opts.away) throw new Error('pass --at or --away, not both');
+    const exitNow = isLong ? snap.price.bid : snap.price.ask;
+    // Measured from the current exit price: a stop sits on the losing side, a take-profit on the winning side.
+    const below = kind === 'sl' ? isLong : !isLong;
+    const triggerPrice = opts.at ? parsePrice(opts.at, 'trigger price') : awayFrom(exitNow, opts.away!, below);
     const position = isLong ? snap.user!.long : snap.user!.short;
     if (!position.isOpen()) throw new Error(`no open ${isLong ? 'long' : 'short'} position to attach an exit to`);
     const d = snap.market.assetDecimals;
@@ -321,11 +340,12 @@ async function exitOrder(kind: 'tp' | 'sl', opts: WriteOptions & SideOptions & {
         ],
         ...orderPlan('create_order', order),
         preview,
+        watch: { kind: 'order', isLong },
     }, opts);
 }
 
-export const cmdTakeProfit = (opts: WriteOptions & SideOptions & { at?: string; size?: string }) => exitOrder('tp', opts);
-export const cmdStopLoss = (opts: WriteOptions & SideOptions & { at?: string; size?: string }) => exitOrder('sl', opts);
+export const cmdTakeProfit = (opts: WriteOptions & SideOptions & { at?: string; away?: string; size?: string }) => exitOrder('tp', opts);
+export const cmdStopLoss = (opts: WriteOptions & SideOptions & { at?: string; away?: string; size?: string }) => exitOrder('sl', opts);
 
 export async function cmdMargin(action: 'add' | 'withdraw', amountText: string, opts: WriteOptions & SideOptions): Promise<void> {
     const s = await openSession(opts);
@@ -344,6 +364,7 @@ export async function cmdMargin(action: 'add' | 'withdraw', amountText: string, 
         lines: [['expires', `ledger ${order.expiration}`], ...lines],
         ...orderPlan('create_order', order),
         preview,
+        watch: { kind: 'order', isLong },
     }, opts);
 }
 
@@ -417,6 +438,7 @@ export async function cmdVault(kind: 'deposit' | 'redeem', amountText: string | 
         ],
         fn: 'create_vault_order',
         args: { user: acct.address, kind: String(vk), amount: amount.toString(), min_out: intent.minOut.toString() },
+        watch: { kind: 'vault' },
     }, opts);
 }
 
@@ -452,4 +474,48 @@ export async function cmdTrustline(opts: WriteOptions): Promise<void> {
     }
     const link = /https:\/\/stellar\.expert\S+/.exec(result.stderr)?.[0];
     process.stdout.write(opts.json ? toJson({ mode: 'sent', asset, explorer: link, command }) + '\n' : `sent: trustline for ${asset.line}${link ? `\n${link}` : ''}\n`);
+}
+
+/** Poll until order `id` is no longer resting, then show what it did. Gives up after the order's TTL or 2 minutes. */
+async function waitForOrder(session: Session, id: number, watch: NonNullable<Plan['watch']>, opts: WriteOptions): Promise<void> {
+    const acct = requireAccount(session);
+    const deadline = Date.now() + Math.min(ttl(opts) * 5, 120) * 1000;
+    let expiration: number | undefined;
+    for (;;) {
+        const snap = await loadSnapshot(session);
+        const orders = await snap.user!.loadOrders(session.sdkNetwork);
+        const resting = orders.find((o) => o.id === id);
+        if (resting?.type === 'order') expiration = resting.order.expiration;
+        if (!resting) {
+            if (expiration !== undefined && snap.market.ledger > expiration) {
+                process.stdout.write(`order #${id} expired unfilled at ledger ${expiration} (price stayed outside its bound); nothing changed\n`);
+                return;
+            }
+            if (watch.kind === 'vault') {
+                process.stdout.write(`order #${id} filled. Run \`stellar zenex balance\` for shares and collateral.\n`);
+                return;
+            }
+            const m = snap.market.accrue(snap.price);
+            const p = watch.isLong ? snap.user!.long : snap.user!.short;
+            if (!p.isOpen()) {
+                process.stdout.write(`order #${id} filled: no open ${watch.isLong ? 'long' : 'short'} position remains for ${acct.ref}\n`);
+                return;
+            }
+            const est = estimatePosition(m, p, snap.price);
+            process.stdout.write(`order #${id} filled. Position now:\n` + kv(positionRows(p, est, session.market.base, session.market.quote)) + '\n');
+            return;
+        }
+        if (Date.now() > deadline) {
+            process.stdout.write(`order #${id} is still resting (expires at ledger ${expiration ?? '?'}); see \`stellar zenex orders\`\n`);
+            return;
+        }
+        await new Promise((r) => setTimeout(r, 3000));
+    }
+}
+
+/** A trigger price a given percent away from `reference`, in the direction the order needs. */
+function awayFrom(reference: bigint, percent: string, below: boolean): bigint {
+    const bps = parsePercentBps(percent, '--away');
+    if (bps === 0n || bps >= 10_000n) throw new Error('--away must be between 0 and 100 percent, exclusive');
+    return below ? (reference * (10_000n - bps)) / 10_000n : (reference * (10_000n + bps)) / 10_000n;
 }

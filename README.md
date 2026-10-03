@@ -26,10 +26,10 @@ stellar zenex balance                             # XLM, USDC, vault shares, cre
 stellar zenex price
 stellar zenex market
 stellar zenex open --long --size 50 --leverage 5  # plan + simulate
-stellar zenex open --long --size 50 --leverage 5 --send
-stellar zenex position
-stellar zenex tp --long --at 0.26 --ttl 17000 --send
-stellar zenex close --long --send
+stellar zenex open --long --size 50 --leverage 5 --send --wait   # waits for the keeper, prints the position
+stellar zenex tp --long --away 20 --ttl 17000 --send              # take-profit 20% above
+stellar zenex sl --long --away 10 --ttl 17000 --send              # stop-loss 10% below
+stellar zenex close --long --send --wait                          # sweeps the attached exits
 stellar zenex history
 ```
 

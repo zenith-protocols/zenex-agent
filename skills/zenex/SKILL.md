@@ -39,9 +39,9 @@ Mainnet: the Stellar CLI's built-in `mainnet` has no RPC; the plugin falls back 
 1. **Never hand-build a `create_order`.** Sizes are 7-decimal, prices 18-decimal, `price_bound` flips direction by side and kind — the plugin encodes all of it. If a command is missing, say so instead of calling the contract directly.
 2. **Dry-run first.** Every write command without `--send` prints the plan (network, account, size, leverage, max fill price, expiry, preview with fees and liquidation price) and only simulates. Read it. Then add `--send`.
 3. **Mainnet is real money.** Before any `--send` with `-n mainnet`, state the plan to the user and get a yes, unless they already authorised this exact trade. Say which network you are on in every status update.
-4. **One action, then look.** After a send, wait ~10 s and run `stellar zenex position` (or `orders`) before deciding the next step. Keepers fill market orders within a ledger or two; never re-send a market order because the position has not updated yet.
+4. **One action, then look.** Send with `--wait`: the plugin polls until the keeper fills (or the order expires) and prints the resulting position, so you never re-send a market order because the position "has not updated yet". Without `--wait`, allow ~10 s and run `stellar zenex position` (or `orders`) before the next step.
 5. **Keep slippage honest.** Default 1%. The plugin refuses `--slippage` above 5% without `--force`; do not pass `--force` unless the user asked for it.
-6. **Parse with `--json`**, print with the default text. Atomic values in JSON are strings; human values are in the text output.
+6. **Parse with `--json`**, print with the default text. In JSON, atomic values are strings and human numbers sit next to them (`price` → `decimal.bid`, `position` → `positions[].estimate.*`, writes → `preview`, `returnValue`, `explorer`).
 7. **Never print or log secrets.** Refer to accounts by identity name or public key.
 8. **Respect the API**: price polling is fine every few seconds; history and candles are rate limited (100/min per IP).
 
@@ -63,20 +63,23 @@ stellar zenex candles --res 1h --count 48  # 1m 5m 15m 1h 4h 1d
 Write (plan + simulate; add `--send` to submit):
 
 ```bash
-stellar zenex open --long --size 50 --leverage 5            # 50 USD long at 5x (margin 10 USDC)
-stellar zenex open --short --size 100 --margin 25           # size it by margin instead
-stellar zenex close --long                                  # full close
-stellar zenex close --long --size 20 --withdraw 2           # partial close, withdraw margin
+stellar zenex open --long --size 50 --leverage 5 --send --wait   # 50 USD long at 5x (margin 10 USDC), wait for the fill
+stellar zenex open --short --size 100 --margin 25                # size it by margin instead
+stellar zenex close --long                                       # full close (dry run; add --send)
+stellar zenex close --long --size 20 --withdraw 2                # partial close, withdraw margin
 stellar zenex limit --long --size 50 --leverage 3 --at 0.20 --ttl 2000
-stellar zenex tp --long --at 0.26 --ttl 17000               # take-profit, standing for ~1 day
-stellar zenex sl --long --at 0.19 --ttl 17000               # stop-loss
+stellar zenex limit --short --size 50 --leverage 3 --away 2      # 2% above the current price
+stellar zenex tp --long --at 0.26 --ttl 17000                    # take-profit at a price, standing ~1 day
+stellar zenex sl --long --away 10 --ttl 17000                    # stop-loss 10% below the current exit price
 stellar zenex margin add 5 --long
 stellar zenex cancel --id 8
-stellar zenex deposit 100 / stellar zenex redeem --all      # LP vault
-stellar zenex claim                                         # pay out claimable credit
+stellar zenex deposit 100 / stellar zenex redeem --all           # LP vault
+stellar zenex claim                                              # pay out claimable credit
 ```
 
-Common flags: `-n <network>`, `-s <identity>`, `-m <market>`, `--slippage <pct>`, `--ttl <ledgers>` (≈5 s each, default 60), `--json`, `--print` (show the `stellar contract invoke` line), `--build-only` (unsigned XDR for `stellar tx sign --sign-with-key <id> | stellar tx send`).
+Common flags: `-n <network>`, `-s <identity>`, `-m <market>`, `--slippage <pct>`, `--ttl <ledgers>` (≈5 s each, default 60), `--wait` (with `--send`), `--json`, `--print` (show the `stellar contract invoke` line), `--build-only` (unsigned XDR for `stellar tx sign --sign-with-key <id> | stellar tx send`).
+
+Prices for `--at` are plain decimals in quote currency (`0.19306`, any precision). Prefer `--away <percent>` for "10% below": it is measured from the right reference (the current exit price for `tp`/`sl`, the entry price for `limit`) and never leaves you doing arithmetic.
 
 A position can be read for any public key without a key: `stellar zenex position -s G…`.
 
@@ -86,13 +89,15 @@ A position can be read for any public key without a key: `stellar zenex position
 - `limit`, `tp`, `sl` rest until the trigger price is crossed, then fill with the same slippage bound measured from the trigger. Give them a long `--ttl`.
 - The preview says `fills` (with fees, execution price, resulting position) or `rests` (legitimate: waits for a keeper or a trigger). A rejected preview means the order can never fill at the current state; the message carries the contract error.
 - Fees per fill: base + impact + a flat keeper fee (0.01 USDC) escrowed with the order. Funding and borrowing accrue hourly; `market` shows the rates, `position` shows what is pending.
-- A freshly filled increase is locked for ~30 s (`unlocked notional` in `position`); a decrease inside the lock is rejected with error 721 — wait and retry.
-- The vault: `deposit` needs the minimum shown in `market`; `redeem` waits out a lock (1 h on current markets) before a keeper fills it. Both rest in `orders` meanwhile and can be cancelled.
+- A freshly filled increase is locked for ~35 s (`unlocked notional` in `position`); a decrease inside the lock is rejected with error 721 before anything is sent — wait and retry.
+- Closing a position in full sweeps its attached `tp`/`sl` orders and refunds their escrow; you do not have to cancel them first. Partial closes keep them.
+- The vault: `deposit` needs the minimum shown in `market`; `redeem` waits out a lock (1 h on current markets) before a keeper fills it. Both rest in `orders` meanwhile and can be cancelled; `balance` lists what they escrow.
 
 ## Reading the numbers
 
 - `size` is notional in USD (USDC); the base amount (XLM) is shown next to it.
-- `leverage` = size / margin; `market` shows the maximum. Opening above it fails the preview (error 713).
+- `leverage` = size / margin; `market` shows the maximum. Opening above it fails the preview (error 713). A `2x` open reads `2.01x` once filled: the open fee comes out of the posted margin.
+- Net result of a round trip = `history` net pnl − the keeper fee (0.01 USDC) per fill; the fills table folds the keeper fee in. The wallet delta in `balance` is the ground truth.
 - `liquidation price` and `health` (equity ÷ maintenance margin; below 1 is liquidatable) come from the exact contract math at the current price.
 - Rates are **percent per hour**. `funding (pays)` means that side currently pays funding to the other.
 
